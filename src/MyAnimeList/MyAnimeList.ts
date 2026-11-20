@@ -44,15 +44,15 @@ const TOKEN_REFRESH_MARGIN = 24 * 60 * 60
 const DEFAULT_TOKEN_LIFETIME = 31 * 24 * 60 * 60
 
 // TEMPORARY: shows debug rows in the source menu. Set to false before publishing.
-const SHOW_DEBUG_TOOLS = true
+const SHOW_DEBUG_TOOLS = false
 
 export const MyAnimeListInfo: SourceInfo = {
     name: 'MyAnimeList',
-    author: 'Netsky',
+    author: 'Netsky, TheyCallMePBJ',
     contentRating: ContentRating.EVERYONE,
     icon: 'icon.png',
-    version: '1.2.1',
-    description: 'MyAnimeList Tracker',
+    version: '2.0.0',
+    description: 'MyAnimeList Tracker (fixed for Paperback 0.8)',
     websiteBaseURL: 'https://myanimelist.net',
     intents: SourceIntents.MANGA_TRACKING | SourceIntents.SETTINGS_UI
 }
