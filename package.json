@@ -5,10 +5,10 @@
   "description": "MyAnimeList tracker for Paperback 0.8.",
   "main": "lib/index.js",
   "scripts": {
-    "migrate": "npx paperback migrate",
-    "bundle": "npx paperback bundle",
-    "serve": "npx paperback serve",
-    "dev": "npx nodemon --watch \"**/*.ts\" --ext \"js ts\" --exec \"npm run serve\""
+    "migrate": "node node_modules/@paperback/toolchain/bin/run migrate",
+    "bundle": "node node_modules/@paperback/toolchain/bin/run bundle",
+    "serve": "node node_modules/@paperback/toolchain/bin/run serve",
+    "lint": "node node_modules/eslint/bin/eslint.js src"
   },
   "repository": {
     "type": "git",

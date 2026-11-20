@@ -4,6 +4,7 @@ import {
     PagedResults,
     SearchRequest,
     DUISection,
+    DUIFormRow,
     SourceInfo,
     Request,
     Response,
@@ -30,13 +31,22 @@ import {
 
 const MYANIMELIST_API = 'https://api.myanimelist.net/v2'
 const MAL_CLIENT_ID = 'c537b0a64d24021367b5367414821be2'
+const MAL_TOKEN_URL = 'https://myanimelist.net/v1/oauth2/token'
+
+// Refresh the access token once it has less than this many seconds left
+const TOKEN_REFRESH_MARGIN = 24 * 60 * 60
+// Used when the expiry can't be read from the token (MAL tokens last 31 days)
+const DEFAULT_TOKEN_LIFETIME = 31 * 24 * 60 * 60
+
+// TEMPORARY: shows debug rows in the source menu. Set to false before publishing.
+const SHOW_DEBUG_TOOLS = true
 
 export const MyAnimeListInfo: SourceInfo = {
     name: 'MyAnimeList',
     author: 'Netsky',
     contentRating: ContentRating.EVERYONE,
     icon: 'icon.png',
-    version: '1.0.1',
+    version: '1.1.0',
     description: 'MyAnimeList Tracker',
     websiteBaseURL: 'https://myanimelist.net',
     intents: SourceIntents.MANGA_TRACKING | SourceIntents.SETTINGS_UI
@@ -51,11 +61,13 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
         interceptor: {
             // Authorization injector
             interceptRequest: async (request: Request): Promise<Request> => {
-                const tokenData = await this.tokenData.get()
+                let tokenData = await this.tokenData.get()
 
-                if (tokenData?.expires_in && (tokenData.expires_in - 1296000) < (Date.now() / 1000)) {
-                    console.log('Access token has expired, refreshing the access token!')
-                    await this.tokenData.refresh()
+                if (tokenData != null && this.isTokenExpiring(tokenData)) {
+                    console.log('[MAL] Access token is about to expire, refreshing it')
+                    await this.refreshAccessToken()
+                    // Use the new token for this request, not the one read above
+                    tokenData = await this.tokenData.get()
                 }
 
                 request.headers = {
@@ -70,10 +82,28 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
                 return request
             },
             interceptResponse: async (response: Response): Promise<Response> => {
+                // 401 means MAL no longer accepts the access token (expired early or revoked).
+                // Mark it as expired so the next request refreshes it first.
+                if (response.status === 401) {
+                    const tokenData = await this.tokenData.get()
+                    if (tokenData != null) {
+                        await this.tokenData.set({ ...tokenData, expires_in: 0 })
+                    }
+                }
                 return response
             }
         }
     });
+
+    // Only used for the OAuth token endpoint. It has no interceptor, so refreshing the
+    // token can't trigger another refresh (the old code looped forever here).
+    authRequestManager = App.createRequestManager({
+        requestsPerSecond: 1,
+        requestTimeout: 20_000
+    });
+
+    // Set while a token refresh is running, so concurrent requests share one refresh
+    refreshInFlight: Promise<void> | undefined;
 
     tokenData = {
         get: async (): Promise<MalToken.Data | undefined> => {
@@ -81,13 +111,9 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
         },
         set: async (tokenData: MalToken.Data | undefined): Promise<void> => {
             await this.stateManager.keychain.store('token_data', tokenData)
-            await this.userInfo.refresh()
         },
         isValid: async (): Promise<boolean> => {
             return (await this.tokenData.get()) != null
-        },
-        refresh: async (): Promise<void> => {
-            await this.refreshAccessToken()
         }
     };
 
@@ -425,28 +451,26 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
     }
 
     async processChapterReadActionQueue(actionQueue: TrackerActionQueue): Promise<void> {
-        await this.userInfo.refresh()
-
         const chapterReadActions = await actionQueue.queuedChapterReadActions()
+        if (chapterReadActions.length == 0) {
+            return
+        }
+
+        let synced = 0
+        const failures: string[] = []
 
         for (const readAction of chapterReadActions) {
             const mangaId = readAction.mangaId
 
             try {
-                let params = {}
-
-                if (Math.floor(readAction.chapterNumber) == 1 && !readAction.volumeNumber) {
-                    params = {
-                        status: 'reading', // Required for API the work properly
-                        num_chapters_read: 1,
-                        num_volumes_read: 1
-                    }
-                } else {
-                    params = {
-                        status: 'reading', // Required for API the work properly
-                        num_chapters_read: Math.floor(readAction.chapterNumber),
-                        num_volumes_read: readAction.volumeNumber ? Math.floor(readAction.volumeNumber) : undefined
-                    }
+                const params: Record<string, string | number> = {
+                    status: 'reading', // Required for the API to work properly
+                    num_chapters_read: Math.floor(readAction.chapterNumber)
+                }
+                // Only send the volume when there is one: an empty `num_volumes_read=`
+                // (what the old code sent for chapters without a volume) gets rejected
+                if (readAction.volumeNumber) {
+                    params['num_volumes_read'] = Math.floor(readAction.volumeNumber)
                 }
 
                 const response = await this.requestManager.schedule(App.createRequest({
@@ -459,17 +483,31 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
                 }), 0)
 
                 if (response.status < 400) {
+                    synced++
                     await actionQueue.discardChapterReadAction(readAction)
                 } else {
-                    console.log(`Action failed: ${response.data}`)
+                    console.log(`[MAL] Chapter sync failed (${response.status}): ${response.data}`)
+                    failures.push(`manga ${mangaId}: HTTP ${response.status} ${response.data ?? ''}`)
                     await actionQueue.retryChapterReadAction(readAction)
                 }
 
             } catch (error) {
                 console.log(error)
+                failures.push(`manga ${mangaId}: ${String(error)}`)
                 await actionQueue.retryChapterReadAction(readAction)
             }
         }
+
+        await this.saveSyncStatus(synced, failures)
+    }
+
+    // Kept so the source menu can show what the last sync did, since the App Store app has no logs
+    async saveSyncStatus(synced: number, failures: string[]): Promise<void> {
+        let status = `${new Date().toISOString()}: ${synced} synced, ${failures.length} failed`
+        if (failures.length > 0) {
+            status += `\n${failures[0]}`.slice(0, 300)
+        }
+        await this.stateManager.store('lastSyncStatus', status)
     }
 
     async getSourceMenu(): Promise<DUISection> {
@@ -487,11 +525,17 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
                             label: 'Logged-in as',
                             value: (await this.userInfo.get())?.name ?? 'ERROR'
                         }),
+                        App.createDUIMultilineLabel({
+                            id: 'lastSyncStatus',
+                            label: 'Last Sync',
+                            value: (await this.stateManager.retrieve('lastSyncStatus') as string | undefined) ?? 'Never'
+                        }),
+                        ...(SHOW_DEBUG_TOOLS ? await this.getDebugRows() : []),
                         App.createDUIButton({
                             id: 'logout',
                             label: 'Logout',
                             onTap: async () => {
-                                await this.tokenData.set(undefined)
+                                await this.logout()
                             }
                         })
                     ]
@@ -515,15 +559,12 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
                                 tokenEndpoint: 'https://myanimelist.net/v1/oauth2/token',
                             },
                             successHandler: async (accessToken: string, refreshToken?: string): Promise<void> => {
-                                //eslint-disable-next-line @typescript-eslint/ban-ts-comment
-                                //@ts-ignore
-                                const tokenBody = JSON.parse(Buffer.from(accessToken?.split('.')[1], 'base64'))
-
                                 await this.tokenData.set({
-                                    expires_in: tokenBody['exp'],
+                                    expires_in: this.getTokenExpiry(accessToken),
                                     access_token: accessToken,
                                     refresh_token: refreshToken
                                 })
+                                await this.userInfo.refresh()
                             }
                         })
                     ]
@@ -572,46 +613,116 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
         }
     }
 
-    async refreshAccessToken(): Promise<void> {
+    // Auth
+
+    isTokenExpiring(tokenData: MalToken.Data): boolean {
+        return tokenData.expires_in - TOKEN_REFRESH_MARGIN < Date.now() / 1000
+    }
+
+    // When the access token expires, in seconds since the epoch. MAL access tokens are JWTs,
+    // so this reads their `exp` claim, falling back to the lifetime MAL reported.
+    getTokenExpiry(accessToken: string, lifetime?: number): number {
         try {
-            const tokenData = await this.tokenData.get()
-
-            //console.log(JSON.stringify(tokenData, null, 2)) // Log request data
-
-            const response = await this.requestManager.schedule(App.createRequest({
-                url: 'https://myanimelist.net/v1/oauth2/token',
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/x-www-form-urlencoded'
-                },
-                data: {
-                    grant_type: 'refresh_token',
-                    refresh_token: tokenData?.refresh_token,
-                    client_id: MAL_CLIENT_ID
-                }
-            }), 1)
-
-            const newTokenData = MalResult<MalToken.Data>(response)
-            if (newTokenData.access_token == null) {
-                throw new Error('Unable to request new "access token", try logging out and back in!')
+            const payload = JSON.parse(Buffer.from(accessToken.split('.')[1] ?? '', 'base64').toString())
+            if (typeof payload?.exp === 'number') {
+                return payload.exp
             }
-            if (newTokenData.refresh_token == null) {
-                throw new Error('Unable to request new "refresh token", try logging out and back in!')
-            }
-
-            //eslint-disable-next-line @typescript-eslint/ban-ts-comment
-            //@ts-ignore
-            const tokenBody = JSON.parse(Buffer.from(newTokenData.split('.')[1], 'base64'))
-
-            // Set the new token data
-            await this.tokenData.set({
-                expires_in: tokenBody['exp'],
-                access_token: newTokenData.access_token,
-                refresh_token: newTokenData.refresh_token
-            })
-
         } catch (error) {
-            throw new Error(error as string)
+            console.log(`[MAL] Couldn't read the token expiry: ${String(error)}`)
         }
+        return Math.floor(Date.now() / 1000) + (lifetime ?? DEFAULT_TOKEN_LIFETIME)
+    }
+
+    // Several requests can notice the expiring token at the same time; they all wait on one refresh.
+    async refreshAccessToken(): Promise<void> {
+        if (this.refreshInFlight != null) {
+            return this.refreshInFlight
+        }
+        this.refreshInFlight = this.performTokenRefresh()
+        try {
+            await this.refreshInFlight
+        } finally {
+            this.refreshInFlight = undefined
+        }
+    }
+
+    async performTokenRefresh(): Promise<void> {
+        const tokenData = await this.tokenData.get()
+        if (tokenData?.refresh_token == null) {
+            await this.logout()
+            throw new Error('MyAnimeList session expired, please log in again')
+        }
+
+        const response = await this.authRequestManager.schedule(App.createRequest({
+            url: MAL_TOKEN_URL,
+            method: 'POST',
+            headers: {
+                'content-type': 'application/x-www-form-urlencoded'
+            },
+            // MAL's token endpoint only accepts form-encoded bodies
+            data: stringify({
+                grant_type: 'refresh_token',
+                refresh_token: tokenData.refresh_token,
+                client_id: MAL_CLIENT_ID
+            })
+        }), 0)
+
+        if (response.status === 400 || response.status === 401) {
+            // The refresh token itself was rejected (expired or revoked), only a new login helps
+            console.log(`[MAL] Token refresh rejected (${response.status}): ${response.data}`)
+            await this.logout()
+            throw new Error('MyAnimeList session expired, please log in again')
+        }
+
+        const newTokenData = MalResult<MalToken.Response>(response)
+        if (!newTokenData.access_token) {
+            throw new Error('MyAnimeList returned no access token while refreshing')
+        }
+
+        await this.tokenData.set({
+            expires_in: this.getTokenExpiry(newTokenData.access_token, newTokenData.expires_in),
+            access_token: newTokenData.access_token,
+            refresh_token: newTokenData.refresh_token ?? tokenData.refresh_token
+        })
+        console.log('[MAL] Access token refreshed')
+    }
+
+    async logout(): Promise<void> {
+        await this.tokenData.set(undefined)
+        await this.stateManager.store('userInfo', undefined)
+    }
+
+    // TEMPORARY debug rows, see SHOW_DEBUG_TOOLS
+    async getDebugRows(): Promise<DUIFormRow[]> {
+        const tokenData = await this.tokenData.get()
+        return [
+            App.createDUILabel({
+                id: 'debugTokenExpiry',
+                label: 'Debug: Token expires',
+                value: tokenData ? new Date(tokenData.expires_in * 1000).toISOString() : 'No token'
+            }),
+            App.createDUIButton({
+                id: 'debugExpireToken',
+                label: 'Debug: Mark token expired',
+                onTap: async () => {
+                    const current = await this.tokenData.get()
+                    if (current != null) {
+                        await this.tokenData.set({ ...current, expires_in: 0 })
+                    }
+                }
+            }),
+            App.createDUIButton({
+                id: 'debugRefreshToken',
+                label: 'Debug: Refresh token now',
+                onTap: async () => {
+                    try {
+                        await this.refreshAccessToken()
+                        await this.stateManager.store('lastSyncStatus', `${new Date().toISOString()}: debug refresh OK`)
+                    } catch (error) {
+                        await this.stateManager.store('lastSyncStatus', `${new Date().toISOString()}: debug refresh FAILED: ${String(error)}`)
+                    }
+                }
+            })
+        ]
     }
 }
