@@ -51,7 +51,7 @@ export const MyAnimeListInfo: SourceInfo = {
     author: 'Netsky',
     contentRating: ContentRating.EVERYONE,
     icon: 'icon.png',
-    version: '1.2.0',
+    version: '1.2.1',
     description: 'MyAnimeList Tracker',
     websiteBaseURL: 'https://myanimelist.net',
     intents: SourceIntents.MANGA_TRACKING | SourceIntents.SETTINGS_UI
@@ -146,11 +146,22 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
 
 
     async getSearchResults(query: SearchRequest, metadata: unknown): Promise<PagedResults> {
-        const pageURL = metadata as string | undefined
+        // Metadata is the next page's URL from a previous page. Ignore anything else the app passes
+        // in (e.g. an empty value on the first page), otherwise it would be used as the URL.
+        const pageURL = typeof metadata === 'string' && metadata.startsWith(MYANIMELIST_API) ? metadata : undefined
         const title = (query.title ?? '').trim()
+
+        // TEMPORARY: records what the app passed in, shown in the debug rows
+        const debugInfo = `title=${JSON.stringify(query.title)} metadata=${JSON.stringify(metadata)}`
+        const saveSearchDebug = async (result: string): Promise<void> => {
+            if (SHOW_DEBUG_TOOLS) {
+                await this.stateManager.store('lastSearchDebug', `${new Date().toISOString()} ${debugInfo} -> ${result}`.slice(0, 400))
+            }
+        }
 
         // MAL answers queries shorter than 3 characters with HTTP 400
         if (pageURL == null && title.length < 3) {
+            await saveSearchDebug('skipped, query under 3 characters')
             return App.createPagedResults({ results: [], metadata: undefined })
         }
 
@@ -160,7 +171,14 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
             method: 'GET'
         }), 1)
 
-        const malPage = MalResult<MalPage.Results>(response)
+        let malPage: MalPage.Results
+        try {
+            malPage = MalResult<MalPage.Results>(response)
+        } catch (error) {
+            await saveSearchDebug(`HTTP ${response.status} ${response.data ?? ''}`)
+            throw error
+        }
+        await saveSearchDebug(`${malPage?.data?.length ?? 0} results`)
 
         //console.log(JSON.stringify(malPage, null, 2)) // Log request data
 
@@ -749,6 +767,11 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
     async getDebugRows(): Promise<DUIFormRow[]> {
         const tokenData = await this.tokenData.get()
         return [
+            App.createDUIMultilineLabel({
+                id: 'debugLastSearch',
+                label: 'Debug: Last search',
+                value: (await this.stateManager.retrieve('lastSearchDebug') as string | undefined) ?? 'None yet'
+            }),
             App.createDUILabel({
                 id: 'debugTokenExpiry',
                 label: 'Debug: Token expires',
