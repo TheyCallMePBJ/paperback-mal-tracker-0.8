@@ -11,6 +11,8 @@ export interface Result {
     authors?: Authors[];
     status?: string;
     media_type?: 'unknown' | 'manga' | 'novel' | 'one_shot' | 'doujinshi' | 'manhwa' | 'manhua' | 'oel';
+    num_chapters?: number; // 0 when unknown (e.g. still publishing)
+    num_volumes?: number;  // 0 when unknown
     my_list_status?: ListItem;
 }
 

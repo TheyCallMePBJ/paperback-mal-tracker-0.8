@@ -5,10 +5,12 @@ import {
     SearchRequest,
     DUISection,
     DUIFormRow,
+    DUIBinding,
     SourceInfo,
     Request,
     Response,
     TrackerActionQueue,
+    TrackedMangaChapterReadAction,
     Searchable,
     MangaProgressProviding,
     SourceManga,
@@ -33,6 +35,9 @@ const MYANIMELIST_API = 'https://api.myanimelist.net/v2'
 const MAL_CLIENT_ID = 'c537b0a64d24021367b5367414821be2'
 const MAL_TOKEN_URL = 'https://myanimelist.net/v1/oauth2/token'
 
+// The 0.8 app takes plain values for form rows, but its types only allow a DUIBinding
+const formValue = (value: unknown): DUIBinding => value as DUIBinding
+
 // Refresh the access token once it has less than this many seconds left
 const TOKEN_REFRESH_MARGIN = 24 * 60 * 60
 // Used when the expiry can't be read from the token (MAL tokens last 31 days)
@@ -46,7 +51,7 @@ export const MyAnimeListInfo: SourceInfo = {
     author: 'Netsky',
     contentRating: ContentRating.EVERYONE,
     icon: 'icon.png',
-    version: '1.1.0',
+    version: '1.2.0',
     description: 'MyAnimeList Tracker',
     websiteBaseURL: 'https://myanimelist.net',
     intents: SourceIntents.MANGA_TRACKING | SourceIntents.SETTINGS_UI
@@ -118,8 +123,8 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
     };
 
     userInfo = {
-        get: async (): Promise<any | undefined> => {
-            return this.stateManager.retrieve('userInfo') as Promise<any | undefined>
+        get: async (): Promise<MalUser.User | undefined> => {
+            return this.stateManager.retrieve('userInfo') as Promise<MalUser.User | undefined>
         },
         isLoggedIn: async (): Promise<boolean> => {
             return (await this.userInfo.get()) != null
@@ -141,10 +146,17 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
 
 
     async getSearchResults(query: SearchRequest, metadata: unknown): Promise<PagedResults> {
-        const pageURL = metadata as string
+        const pageURL = metadata as string | undefined
+        const title = (query.title ?? '').trim()
+
+        // MAL answers queries shorter than 3 characters with HTTP 400
+        if (pageURL == null && title.length < 3) {
+            return App.createPagedResults({ results: [], metadata: undefined })
+        }
 
         const response = await this.requestManager.schedule(App.createRequest({
-            url: pageURL ?? `${MYANIMELIST_API}/manga?q=${encodeURI(query.title ?? '')}&nsfw=true`,
+            // encodeURIComponent, so titles with & # ? don't cut the query short
+            url: pageURL ?? `${MYANIMELIST_API}/manga?q=${encodeURIComponent(title)}&limit=30&nsfw=true`,
             method: 'GET'
         }), 1)
 
@@ -196,8 +208,6 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
                 desc: malManga?.synopsis || '',
                 hentai: this.formatNSFW(malManga?.nsfw ?? ''),
                 rating: malManga.mean,
-                // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-                // @ts-ignore
                 status: this.formatStatus(malManga.status)
             })
         })
@@ -328,8 +338,7 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
                         rows: async () => [
                             App.createDUISelect({
                                 id: 'status',
-                                //@ts-ignore
-                                value: malManga.my_list_status?.status ? [malManga.my_list_status.status] : await getDefaultStatus(this.stateManager),
+                                value: formValue(malManga.my_list_status?.status ? [malManga.my_list_status.status] : await getDefaultStatus(this.stateManager)),
                                 allowsMultiselect: false,
                                 label: 'Status',
                                 labelResolver: async (value) => {
@@ -355,16 +364,14 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
                             App.createDUIStepper({
                                 id: 'num_chapters_read',
                                 label: 'Chapter',
-                                //@ts-ignore
-                                value: malManga.my_list_status?.num_chapters_read ?? 0,
+                                value: formValue(malManga.my_list_status?.num_chapters_read ?? 0),
                                 min: 0,
                                 step: 1
                             }),
                             App.createDUIStepper({
                                 id: 'num_volumes_read',
                                 label: 'Volume',
-                                //@ts-ignore
-                                value: malManga.my_list_status?.num_volumes_read ?? 0,
+                                value: formValue(malManga.my_list_status?.num_volumes_read ?? 0),
                                 min: 0,
                                 step: 1
                             })
@@ -379,8 +386,7 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
                             App.createDUIStepper({
                                 id: 'score',
                                 label: 'Score',
-                                //@ts-ignore
-                                value: malManga.my_list_status?.score ?? 0,
+                                value: formValue(malManga.my_list_status?.score ?? 0),
                                 min: 0,
                                 max: 10,
                                 step: 1
@@ -396,8 +402,7 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
                             App.createDUIStepper({
                                 id: 'num_times_reread',
                                 label: 'Re-read Amount',
-                                //@ts-ignore
-                                value: malManga.my_list_status?.reread_value ?? 0,
+                                value: formValue(malManga.my_list_status?.num_times_reread ?? 0),
                                 min: 0,
                                 max: 100,
                                 step: 1
@@ -413,8 +418,7 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
                             App.createDUIInputField({
                                 id: 'notes',
                                 label: 'Notes',
-                                //@ts-ignore
-                                value: malManga.my_list_status?.comments ?? ''
+                                value: formValue(malManga.my_list_status?.comments ?? '')
                             })
                         ]
                     })
@@ -422,15 +426,20 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
             },
             onSubmit: async (values) => {
                 const status = values['status']?.[0] ?? ''
+                let response: Response
 
                 if (status == 'NONE' && mangaId != null) {
-                    await this.requestManager.schedule(App.createRequest({
+                    response = await this.requestManager.schedule(App.createRequest({
                         url: `${MYANIMELIST_API}/manga/${parseInt(mangaId)}/my_list_status`,
                         method: 'DELETE'
                     }), 1)
+                    // 404 means the title wasn't on the list in the first place
+                    if (response.status === 404) {
+                        return
+                    }
 
                 } else {
-                    await this.requestManager.schedule(App.createRequest({
+                    response = await this.requestManager.schedule(App.createRequest({
                         url: `${MYANIMELIST_API}/manga/${parseInt(mangaId)}/my_list_status`,
                         method: 'PUT',
                         headers: {
@@ -442,9 +451,14 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
                             num_volumes_read: Number(values['num_volumes_read']),
                             score: Number(values['score']),
                             num_times_reread: Number(values['num_times_reread']),
-                            comments: values['notes']
+                            comments: values['notes'] ?? ''
                         })
                     }), 1)
+                }
+
+                // Surface failures instead of silently dropping the changes
+                if (response.status >= 400) {
+                    throw new Error(`MyAnimeList rejected the changes (HTTP ${response.status}): ${response.data ?? ''}`)
                 }
             }
         })
@@ -456,49 +470,92 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
             return
         }
 
+        // Several chapters of one title can be queued; one update per title is enough
+        const actionsByManga = new Map<string, TrackedMangaChapterReadAction[]>()
+        for (const readAction of chapterReadActions) {
+            const actions = actionsByManga.get(readAction.mangaId) ?? []
+            actions.push(readAction)
+            actionsByManga.set(readAction.mangaId, actions)
+        }
+
         let synced = 0
         const failures: string[] = []
 
-        for (const readAction of chapterReadActions) {
-            const mangaId = readAction.mangaId
-
+        for (const [mangaId, actions] of actionsByManga) {
             try {
-                const params: Record<string, string | number> = {
-                    status: 'reading', // Required for the API to work properly
-                    num_chapters_read: Math.floor(readAction.chapterNumber)
-                }
-                // Only send the volume when there is one: an empty `num_volumes_read=`
-                // (what the old code sent for chapters without a volume) gets rejected
-                if (readAction.volumeNumber) {
-                    params['num_volumes_read'] = Math.floor(readAction.volumeNumber)
-                }
+                const response = await this.syncReadProgress(mangaId, actions)
 
-                const response = await this.requestManager.schedule(App.createRequest({
-                    url: `${MYANIMELIST_API}/manga/${parseInt(mangaId)}/my_list_status`,
-                    method: 'PUT',
-                    headers: {
-                        'content-type': 'application/x-www-form-urlencoded'
-                    },
-                    data: stringify(params)
-                }), 0)
-
-                if (response.status < 400) {
+                if (response == null || response.status < 400) {
                     synced++
-                    await actionQueue.discardChapterReadAction(readAction)
+                    for (const action of actions) {
+                        await actionQueue.discardChapterReadAction(action)
+                    }
                 } else {
                     console.log(`[MAL] Chapter sync failed (${response.status}): ${response.data}`)
                     failures.push(`manga ${mangaId}: HTTP ${response.status} ${response.data ?? ''}`)
-                    await actionQueue.retryChapterReadAction(readAction)
+                    for (const action of actions) {
+                        await actionQueue.retryChapterReadAction(action)
+                    }
                 }
 
             } catch (error) {
                 console.log(error)
                 failures.push(`manga ${mangaId}: ${String(error)}`)
-                await actionQueue.retryChapterReadAction(readAction)
+                for (const action of actions) {
+                    await actionQueue.retryChapterReadAction(action)
+                }
             }
         }
 
         await this.saveSyncStatus(synced, failures)
+    }
+
+    // Updates one title's list entry from the chapters read in Paperback.
+    // Returns undefined when MAL is already up to date and nothing was sent.
+    async syncReadProgress(mangaId: string, actions: TrackedMangaChapterReadAction[]): Promise<Response | undefined> {
+        const chapter = Math.max(...actions.map(action => Math.floor(action.chapterNumber)))
+        const volume = Math.max(0, ...actions.map(action => Math.floor(action.volumeNumber || 0)))
+
+        const malManga = MalResult<MalManga.Result>(await this.requestManager.schedule(App.createRequest({
+            url: `${MYANIMELIST_API}/manga/${parseInt(mangaId)}?fields=num_chapters,num_volumes,my_list_status`,
+            method: 'GET'
+        }), 0))
+        const current = malManga.my_list_status
+
+        // Never lower progress, e.g. when going back to re-read an earlier chapter
+        if (current != null && (current.num_chapters_read ?? 0) >= chapter) {
+            return undefined
+        }
+
+        const totalChapters = malManga.num_chapters ?? 0
+        const params: Record<string, string | number> = {
+            num_chapters_read: chapter
+        }
+
+        if (totalChapters > 0 && chapter >= totalChapters) {
+            // Read the last chapter
+            params['status'] = 'completed'
+            if (malManga.num_volumes) {
+                params['num_volumes_read'] = malManga.num_volumes
+            }
+        } else {
+            // Keep "completed" as it is; anything else (not listed, planned, on hold,
+            // dropped) becomes "reading", since a new chapter was just read
+            params['status'] = current?.status === 'completed' ? 'completed' : 'reading'
+            // Only send the volume when there is one: an empty `num_volumes_read=` gets rejected
+            if (volume > (current?.num_volumes_read ?? 0)) {
+                params['num_volumes_read'] = volume
+            }
+        }
+
+        return this.requestManager.schedule(App.createRequest({
+            url: `${MYANIMELIST_API}/manga/${parseInt(mangaId)}/my_list_status`,
+            method: 'PUT',
+            headers: {
+                'content-type': 'application/x-www-form-urlencoded'
+            },
+            data: stringify(params)
+        }), 0)
     }
 
     // Kept so the source menu can show what the last sync did, since the App Store app has no logs
@@ -550,13 +607,9 @@ export class MyAnimeList implements Searchable, MangaProgressProviding {
                             responseType: {
                                 type: 'pkce',
                                 pkceCodeLength: 64,
-                                // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-                                // @ts-ignore
-                                pkceCodeMethod: 'plain',
-                                // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-                                // @ts-ignore
-                                formEncodeGrant: true,
-                                tokenEndpoint: 'https://myanimelist.net/v1/oauth2/token',
+                                pkceCodeMethod: 'plain', // MAL only supports plain PKCE
+                                formEncodeGrant: true, // MAL's token endpoint only accepts form-encoded bodies
+                                tokenEndpoint: MAL_TOKEN_URL
                             },
                             successHandler: async (accessToken: string, refreshToken?: string): Promise<void> => {
                                 await this.tokenData.set({
